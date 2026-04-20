@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-python3 start.py
+python3 start.py "$@"

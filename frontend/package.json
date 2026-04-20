@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "dev": "node scripts/build.mjs --watch"
+    "dev": "node scripts/build.mjs --watch --host"
   },
   "devDependencies": {
     "dotenv": "^16.5.0",

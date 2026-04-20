@@ -4,6 +4,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import cv2
@@ -14,7 +15,8 @@ from aiortc.mediastreams import MediaStreamTrack, VideoStreamTrack
 from av import VideoFrame
 from dotenv import load_dotenv
 
-load_dotenv(override=False)
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=False)
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -22,6 +24,27 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("webrtc-4cams")
+
+
+def _install_asyncio_exception_handler() -> None:
+    """
+    Suppress the harmless aioice race that logs:
+      'Exception in callback Transaction.__retry() ... InvalidStateError: invalid state'
+    This happens when an ICE transaction timer fires after the connection is
+    already closed/succeeded – it is a known aioice quirk, not a real error.
+    """
+    loop = asyncio.get_event_loop()
+    original = loop.default_exception_handler
+
+    def _handler(loop: asyncio.AbstractEventLoop, ctx: dict) -> None:
+        exc = ctx.get("exception")
+        source = ctx.get("source_traceback") or []
+        source_str = "".join(str(frame) for frame in source)
+        if isinstance(exc, asyncio.InvalidStateError) and "stun.py" in source_str:
+            return
+        original(ctx)
+
+    loop.set_exception_handler(_handler)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -96,8 +119,10 @@ class OpenCVCameraTrack(VideoStreamTrack):
     """
     OpenCV capture -> WebRTC VideoStreamTrack.
 
-    Important: we must provide monotonically increasing timestamps (pts/time_base),
-    otherwise browsers may receive the track but not render frames.
+    All blocking OpenCV calls (open + read) run in a thread-pool executor so
+    they never stall the asyncio event loop.  This is critical for:
+      - keeping WebSocket keepalive alive while a camera takes time to connect;
+      - achieving full FPS because cap.read() can take >30 ms on RTSP streams.
     """
 
     def __init__(self, source: str, width: int, height: int, fps: int, buffersize: int):
@@ -108,17 +133,17 @@ class OpenCVCameraTrack(VideoStreamTrack):
         self._fps = fps
         self._buffersize = buffersize
         self._cap: Optional[cv2.VideoCapture] = None
-        self._frame_index = 0
         self._lock = asyncio.Lock()
 
-    def _open(self) -> None:
-        if self._cap is not None:
-            return
+    # ------------------------------------------------------------------
+    # Synchronous helpers – called only from run_in_executor
+    # ------------------------------------------------------------------
+
+    def _open_sync(self) -> cv2.VideoCapture:
         src: Any = self._source
         if isinstance(self._source, str) and self._source.isdigit():
             src = int(self._source)
         if isinstance(src, str) and src.lower().startswith("rtsp://"):
-            # OpenCV reads these options only from the environment.
             if OPENCV_FFMPEG_CAPTURE_OPTIONS:
                 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = OPENCV_FFMPEG_CAPTURE_OPTIONS
                 logger.info("cam=%s ffmpeg_opts=%s", self._source, OPENCV_FFMPEG_CAPTURE_OPTIONS)
@@ -137,39 +162,71 @@ class OpenCVCameraTrack(VideoStreamTrack):
             cap.release()
             logger.error("Failed to open camera source: %s", self._source)
             raise RuntimeError(f"Failed to open camera source: {self._source}")
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         logger.info("Opened camera source: %s", self._source)
-        self._cap = cap
+        logger.info(
+            "cam=%s requested=%sx%s@%s actual=%sx%s@%.2f",
+            self._source,
+            self._width,
+            self._height,
+            self._fps,
+            actual_w,
+            actual_h,
+            actual_fps,
+        )
+        return cap
 
-    async def recv(self) -> VideoFrame:
-        async with self._lock:
-            self._open()
-            assert self._cap is not None
+    def _read_sync(self):
+        assert self._cap is not None
+        return self._cap.read()
 
-            # Blocking read (OpenCV); keep minimal for now.
-            ok, frame = self._cap.read()
-            if not ok or frame is None:
-                logger.warning("Camera read failed, reopening: %s", self._source)
-                self._cap.release()
-                self._cap = None
-                await asyncio.sleep(0.2)
-                self._open()
-                assert self._cap is not None
-                ok, frame = self._cap.read()
-                if not ok or frame is None:
-                    raise asyncio.CancelledError("Camera read failed")
-
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            vf = VideoFrame.from_ndarray(frame, format="rgb24")
-            pts, time_base = await self.next_timestamp()
-            vf.pts = pts
-            vf.time_base = time_base
-            return vf
-
-    async def stop(self) -> None:
-        await super().stop()
+    def _release_sync(self) -> None:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+
+    # ------------------------------------------------------------------
+    # Async interface
+    # ------------------------------------------------------------------
+
+    async def _ensure_open(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Open the capture if not already open. Raises RuntimeError on failure."""
+        if self._cap is None:
+            self._cap = await loop.run_in_executor(None, self._open_sync)
+
+    async def recv(self) -> VideoFrame:
+        loop = asyncio.get_running_loop()
+
+        async with self._lock:
+            await self._ensure_open(loop)
+
+            ok, frame = await loop.run_in_executor(None, self._read_sync)
+            if not ok or frame is None:
+                logger.warning("Camera read failed, reopening: %s", self._source)
+                await loop.run_in_executor(None, self._release_sync)
+                await asyncio.sleep(0.2)
+                await self._ensure_open(loop)
+                ok, frame = await loop.run_in_executor(None, self._read_sync)
+                if not ok or frame is None:
+                    raise asyncio.CancelledError(f"Camera read failed: {self._source}")
+
+        # Some RTSP sources ignore CAP_PROP_FRAME_WIDTH/HEIGHT; enforce output size.
+        if self._width and self._height:
+            if frame.shape[1] != self._width or frame.shape[0] != self._height:
+                frame = cv2.resize(frame, (self._width, self._height), interpolation=cv2.INTER_LINEAR)
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        vf = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
+        pts, time_base = await self.next_timestamp()
+        vf.pts = pts
+        vf.time_base = time_base
+        return vf
+
+    def stop(self) -> None:
+        super().stop()
+        self._release_sync()
 
 
 class SignalingError(Exception):
@@ -181,7 +238,10 @@ def _json_dumps(msg: Dict[str, Any]) -> str:
 
 
 async def _send(ws, msg: Dict[str, Any]) -> None:
-    await ws.send(_json_dumps(msg))
+    try:
+        await ws.send(_json_dumps(msg))
+    except websockets.exceptions.ConnectionClosed:
+        pass
 
 
 async def _expect(msg: Dict[str, Any], key: str, typ):
@@ -195,15 +255,27 @@ class App:
     def __init__(self, cfg: CameraConfig):
         self.cfg = cfg
         self.relay = MediaRelay()
-        self.camera_tracks: list[MediaStreamTrack] = []
+        # Храним только исходные треки камер.
+        # Подписки relay выдаем по запросу для каждого нового peer.
+        self.base_tracks: list[OpenCVCameraTrack] = []
+
         for src in cfg.sources:
             base = OpenCVCameraTrack(src, cfg.width, cfg.height, cfg.fps, cfg.buffersize)
-            self.camera_tracks.append(self.relay.subscribe(base))
+            self.base_tracks.append(base)
 
     def get_track(self, camera_index: int) -> MediaStreamTrack:
-        if camera_index < 0 or camera_index >= len(self.camera_tracks):
+        if camera_index < 0 or camera_index >= len(self.base_tracks):
             raise SignalingError("cameraIndex out of range")
-        return self.camera_tracks[camera_index]
+        # Каждый PeerConnection должен получить отдельную relay-подписку.
+        return self.relay.subscribe(self.base_tracks[camera_index])
+
+    async def shutdown(self):
+        """Корректно освобождаем все ресурсы камер"""
+        for track in self.base_tracks:
+            try:
+                track.stop()
+            except Exception as e:
+                logger.warning("Failed to stop track: %s", e)
 
 
 async def handle_client(ws, app: App):
@@ -293,6 +365,7 @@ async def handle_client(ws, app: App):
 
 
 async def main():
+    _install_asyncio_exception_handler()
     sources = load_camera_sources()
     cfg = CameraConfig(
         sources=sources,
@@ -305,8 +378,12 @@ async def main():
 
     logger.info("Signaling WS on ws://%s:%s", SIGNALING_HOST, SIGNALING_PORT)
     logger.info("Cameras: %s", cfg.sources)
-    async with websockets.serve(lambda ws: handle_client(ws, app), SIGNALING_HOST, SIGNALING_PORT):
-        await asyncio.Future()
+    try:
+        async with websockets.serve(lambda ws: handle_client(ws, app), SIGNALING_HOST, SIGNALING_PORT):
+            await asyncio.Future()
+    finally:
+        # ← Гарантированно освобождаем камеры при выходе
+        await app.shutdown()
 
 
 if __name__ == "__main__":
