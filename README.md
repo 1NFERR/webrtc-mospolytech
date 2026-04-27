@@ -1,50 +1,48 @@
 # WebRTC Car Video Prototype
 
-This repo contains three loosely coupled components that demonstrate how a remote operator can watch a car-mounted camera stream over WebRTC via Keycloak-protected signaling.
+Repository contains 3 services:
+- `signaling-server` (Node.js): auth + signaling relay
+- `frontend` (Vite/TS): operator UI
+- `car-video-client` (Python): car-side WebRTC sender
 
-## Components
+## Unified start
 
-1. **car-video-client** – Python service that runs next to the car. It authenticates with Keycloak using the client-credentials flow, connects to the signaling server via WebSocket, and answers incoming WebRTC offers by streaming a placeholder image as video (the code is structured so a real camera feed can be plugged in later).
-2. **signaling-server** – Node.js WebSocket + REST server that performs token validation, keeps track of which car clients are online, enforces the “one operator per car” rule, and relays SDP/ICE messages between peers.
-3. **frontend** – Vite + vanilla TypeScript SPA that authenticates the operator through Keycloak (using `keycloak-js`), lists available cars, and establishes a WebRTC connection through the signaling server to display the remote video.
+```bash
+python start.py
+```
 
-## High-level flow
+Optional:
 
-1. The car client boots, grabs a Keycloak service token (client credentials), and opens a WebSocket to the signaling server with its `client_id`.
-2. The signaling server validates the token, registers the car as available, and waits for an operator to request it.
-3. The operator uses the frontend, which logs them into Keycloak. Their bearer token is attached when the UI connects to the signaling server.
-4. When the operator selects a car, the frontend creates an SDP offer, which travels through the signaling server to the car client. The car answers and starts pushing video frames.
-5. The signaling server relays ICE candidates both ways until the direct peer connection becomes established. Only one operator can be attached to a car at a time; additional operators see an error until the session ends.
+```bash
+python start.py --skip-update
+```
 
-Each folder contains its own README with setup instructions and environment variables.
+Wrappers:
+- Linux/macOS: `./start.sh`
+- Windows: `start.bat`
 
-## Quick start (local demo)
+`start.py` creates missing `.env` files from `.env.example`, installs dependencies (unless skipped), picks free ports, and runs all 3 services.
 
-The default configuration lets you try the full flow without a real Keycloak server by enabling insecure tokens on the signaling server and pasting `demo` as the operator token in the UI.
+## Video source modes
 
-1. **Signaling server**
-   ```bash
-   cd signaling-server
-   npm install
-   cp .env.example .env  # keep ALLOW_INSECURE_TOKENS=true for local tests
-   npm run dev
-   ```
-2. **Car video client**
-   ```bash
-   cd car-video-client
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   cp .env.example .env  # edit SIGNALING_WS_URL if needed
-   python main.py
-   ```
-3. **Frontend**
-   ```bash
-   cd frontend
-   npm install
-   cp .env.example .env
-   npm run dev
-   ```
-   Browse to the Vite dev URL, enable manual token mode (`VITE_SKIP_KEYCLOAK=true`), paste `demo` as the token, select the `car-001` entry, and click **Connect**.
+`car-video-client` supports only:
+- RTSP cameras (`MEDIA_SOURCES` list, multiple per car)
+- local webcams (`MEDIA_SOURCES` with `type=webcam`)
 
-Replace the insecure shortcuts with real Keycloak URLs when you are ready to wire everything to an actual identity provider.
+After selecting a car, frontend shows all of its camera tracks (up to 4 tiles now).
+On source failures it uses a placeholder image (`car-video-client/assets/no_signal.png`).
+
+## Security baseline
+
+- Set `signaling-server/.env`: `ALLOW_INSECURE_TOKENS=false`
+- Use reachable Keycloak host/IP consistently in all services (for local: `http://127.0.0.1:8080`)
+- Configure:
+  - `KEYCLOAK_JWKS_URL` / `KEYCLOAK_ISSUER` in signaling
+  - `KEYCLOAK_TOKEN_URL` + client credentials in car client
+  - `VITE_KEYCLOAK_URL` in frontend
+
+## Quick demo mode (no Keycloak)
+
+- `signaling-server/.env`: `ALLOW_INSECURE_TOKENS=true`
+- `frontend/.env`: `VITE_SKIP_KEYCLOAK=true`
+- `car-video-client/.env`: `KEYCLOAK_TOKEN_URL=` and `SIGNALING_AUTH_TOKEN=demo`

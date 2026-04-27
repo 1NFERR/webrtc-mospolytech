@@ -38,13 +38,27 @@ const send = (socket, payload) => {
   }
 };
 
+const normalizeCameraList = (value) => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => String(entry ?? "").trim())
+    .filter(Boolean);
+};
+
+const buildCarSnapshot = (clientId, car) => ({
+  clientId,
+  status: car.operatorId ? "busy" : "idle",
+  connectedAt: car.connectedAt,
+  operatorId: car.operatorId,
+  cameras: car.cameras || [],
+});
+
 const broadcastCarSnapshot = () => {
-  const snapshot = Array.from(cars.entries()).map(([clientId, car]) => ({
-    clientId,
-    status: car.operatorId ? "busy" : "idle",
-    connectedAt: car.connectedAt,
-    operatorId: car.operatorId,
-  }));
+  const snapshot = Array.from(cars.entries()).map(([clientId, car]) =>
+    buildCarSnapshot(clientId, car)
+  );
   for (const [, operator] of operators) {
     send(operator.socket, { type: "clients", data: snapshot });
   }
@@ -78,14 +92,16 @@ const registerCar = async (socket, message) => {
 
   const peerId = crypto.randomUUID();
   peerMeta.set(socket, { id: peerId, role: "car", clientId });
+  const cameras = normalizeCameraList(message.cameras);
   cars.set(clientId, {
     socket,
     operatorId: null,
     connectedAt: Date.now(),
     tokenSub: tokenPayload.sub,
+    cameras,
   });
-  send(socket, { type: "registered", role: "car", clientId });
-  console.log(`[car] registered ${clientId}`);
+  send(socket, { type: "registered", role: "car", clientId, cameras });
+  console.log(`[car] registered ${clientId} cameras=${cameras.length}`);
   broadcastCarSnapshot();
 };
 
@@ -110,11 +126,9 @@ const registerOperator = async (socket, message) => {
   send(socket, { type: "registered", role: "operator", username });
   send(socket, {
     type: "clients",
-    data: Array.from(cars.entries()).map(([clientId, car]) => ({
-      clientId,
-      status: car.operatorId ? "busy" : "idle",
-      connectedAt: car.connectedAt,
-    })),
+    data: Array.from(cars.entries()).map(([clientId, car]) =>
+      buildCarSnapshot(clientId, car)
+    ),
   });
   console.log(`[operator] ${username} connected`);
 };
@@ -149,6 +163,7 @@ const attachOperatorToCar = (socket, message) => {
   send(operator.socket, {
     type: "watch-accepted",
     clientId: message.clientId,
+    cameras: car.cameras || [],
   });
   send(car.socket, {
     type: "operator-ready",
@@ -334,11 +349,9 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/clients", (_req, res) => {
-  const payload = Array.from(cars.entries()).map(([clientId, car]) => ({
-    clientId,
-    status: car.operatorId ? "busy" : "idle",
-    connectedAt: car.connectedAt,
-  }));
+  const payload = Array.from(cars.entries()).map(([clientId, car]) =>
+    buildCarSnapshot(clientId, car)
+  );
   res.json(payload);
 });
 

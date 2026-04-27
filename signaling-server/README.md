@@ -12,6 +12,8 @@ cp .env.example .env
 
 Fill in the Keycloak settings.
 
+For local p2p deployments without a domain, use direct host/IP (for example `http://127.0.0.1:8080`) consistently in all services.
+
 ## Running
 
 ```bash
@@ -32,8 +34,23 @@ This starts both the HTTP API (for health checks and listing cars) and the WebSo
 | `OPERATOR_AUDIENCE` | Expected `aud` claim for operator tokens. |
 | `CAR_SERVICE_CLIENT_ID` | Only tokens with this client ID may register as cars. |
 | `OPERATOR_REQUIRED_ROLE` | Realm/client role that an operator must have. |
-| `ALLOW_INSECURE_TOKENS` | Set to `true` to skip verification when testing locally (not for production). |
+| `ALLOW_INSECURE_TOKENS` | Must be `false` for real protection. `true` disables JWT verification entirely. |
 | `PING_INTERVAL_MS` | How often to ping idle sockets (default `25000`). |
+
+For quick local demo without Keycloak, set `ALLOW_INSECURE_TOKENS=true`.
+
+## Secure local mode (no domain)
+
+Use these values in `.env`:
+
+- `KEYCLOAK_JWKS_URL=http://127.0.0.1:8080/realms/cars/protocol/openid-connect/certs`
+- `KEYCLOAK_ISSUER=http://127.0.0.1:8080/realms/cars`
+- `ALLOW_INSECURE_TOKENS=false`
+
+Also ensure:
+
+- car client uses `KEYCLOAK_TOKEN_URL=http://127.0.0.1:8080/realms/cars/protocol/openid-connect/token`
+- frontend uses `VITE_KEYCLOAK_URL=http://127.0.0.1:8080`
 
 `GET /health` returns `{ status: "ok" }`.
 

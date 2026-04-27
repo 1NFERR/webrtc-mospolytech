@@ -1,8 +1,12 @@
 # Car Video Client
 
-Python service that runs next to the car hardware. It authenticates with Keycloak via the client-credentials flow, keeps a persistent WebSocket connection to the signaling server, and answers incoming WebRTC offers by streaming a placeholder image.
+Python service that registers as a car in signaling, receives WebRTC offers, and streams video from:
+- RTSP IP camera via `aiortc.contrib.media.MediaPlayer`
+- local webcam via `MediaPlayer` (FFmpeg backend)
 
-The video pipeline is intentionally abstracted so a real camera capture component can replace the demo image track later.
+One car can expose multiple cameras at once. Each incoming operator session receives all configured camera tracks in one WebRTC connection.
+
+If camera initialization or frame read fails, the client streams a `no_signal` placeholder frame.
 
 ## Setup
 
@@ -14,31 +18,25 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Fill in `.env` with the values from your Keycloak realm and signaling server.
-
-## Running
+## Run
 
 ```bash
 source .venv/bin/activate
 python main.py
 ```
 
-The client keeps reconnecting automatically if the signaling server is not reachable yet.
+## Main env variables
 
-## Environment variables
+- `MEDIA_SOURCES`: JSON array with camera configs (`id`, `type`, `url`, optional `format`, `options`, `rtsp_options`, `use_frame_processing`)
+- `DEFAULT_CAMERA_ID`: fallback/default camera ID from `MEDIA_SOURCES`
+- `DEFAULT_WEBCAM_OPTIONS`: default ffmpeg options for webcam sources
+- `RTSP_OPTIONS`: JSON object with RTSP tuning options
+- `PLACEHOLDER_IMAGE_PATH`: fallback image path (`assets/no_signal.png` by default)
+- `KEYCLOAK_TOKEN_URL`: service token endpoint (use reachable host/IP, e.g. `http://127.0.0.1:8080/...`)
+- `SIGNALING_AUTH_TOKEN`: keep empty in secure mode (only for temporary insecure tests)
 
-| Name | Description |
-| --- | --- |
-| `CLIENT_ID` | Identifier used by the car; the operator references it from the frontend. |
-| `IMAGE_PATH` | Path to the placeholder image that should be streamed. Defaults to `assets/demo.jpg`. |
-| `SIGNALING_WS_URL` | WebSocket endpoint of the signaling server, e.g. `ws://localhost:4000/ws`. |
-| `ICE_SERVERS` | JSON (or comma-separated list) describing the STUN/TURN servers for ICE, e.g. `[{"urls":["stun:stun.l.google.com:19302"]}]`. |
-| `KEYCLOAK_TOKEN_URL` | Token endpoint used for client credentials, e.g. `https://keycloak.local/realms/cars/protocol/openid-connect/token`. |
-| `KEYCLOAK_CLIENT_ID` | Keycloak service account client ID. |
-| `KEYCLOAK_CLIENT_SECRET` | Secret for the service account. |
-| `TOKEN_REFRESH_MARGIN` | Seconds before expiry to refresh the token (default 30). |
-| `LOG_LEVEL` | python logging level (`INFO`, `DEBUG`, …). |
+Quick demo (without Keycloak): set `KEYCLOAK_TOKEN_URL=` and `SIGNALING_AUTH_TOKEN=demo`.
 
-## Replacing the placeholder video
+The processing hook is implemented in `ProcessingVideoTrack` (`media_manager.py`) and can be extended with OpenCV/NN inference later.
 
-`StaticImageStreamTrack` (see `video_track.py`) is the only demo-specific part. Swap it with a class that pulls frames from a camera or GStreamer pipeline and yields `av.VideoFrame` objects. The rest of the signaling and authentication stack remains unchanged.
+For mixed camera vendors, set `rtsp_options` per camera directly inside `MEDIA_SOURCES` (for example Wisenet and Milesight may require different buffering/analysis values).

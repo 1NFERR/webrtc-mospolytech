@@ -56,11 +56,13 @@ class SignalingClient:
             await self._ws.close()
 
     async def _register(self, ws: WebSocketClientProtocol, token: str) -> None:
+        camera_ids = [source.id for source in self._settings.media_sources]
         payload = {
             "type": "register",
             "role": "car",
             "clientId": self._settings.client_id,
             "token": token,
+            "cameras": camera_ids,
         }
         await ws.send(json.dumps(payload))
 

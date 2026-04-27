@@ -2,6 +2,8 @@
 
 Vite + TypeScript single-page app that lets an operator authenticate via Keycloak, see which cars are online, and establish a WebRTC session through the signaling server.
 
+After choosing a car, the UI displays all camera tracks from that car simultaneously (currently a 2x2 grid for 4 cameras).
+
 ## Setup
 
 ```bash

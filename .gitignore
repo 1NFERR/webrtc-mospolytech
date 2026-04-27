@@ -20,7 +20,3 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
-
-# Video assets (likely large files)
-cams_videos/
-assets/

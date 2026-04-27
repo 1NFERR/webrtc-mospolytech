@@ -31,27 +31,41 @@ class KeycloakTokenProvider:
 
     async def _refresh_token(self) -> None:
         if not self._settings.keycloak_token_url:
-            raise RuntimeError("KEYCLOAK_TOKEN_URL is not configured")
+            if not self._settings.signaling_auth_token:
+                raise RuntimeError(
+                    "Auth is not configured: set KEYCLOAK_TOKEN_URL for secure mode, "
+                    "or set SIGNALING_AUTH_TOKEN only for temporary insecure testing."
+                )
+            self._token = self._settings.signaling_auth_token
+            self._expires_at = time.time() + 3600
+            logging.warning(
+                "KEYCLOAK_TOKEN_URL is not configured, using SIGNALING_AUTH_TOKEN fallback"
+            )
+            return
 
-        # data = {
-        #     "client_id": self._settings.keycloak_client_id,
-        #     "client_secret": self._settings.keycloak_client_secret,
-        #     "grant_type": "client_credentials",
-        # }
-        # logging.info("Requesting Keycloak token for %s", self._settings.client_id)
-        # async with aiohttp.ClientSession() as session:
-        #     async with session.post(self._settings.keycloak_token_url, data=data) as resp:
-        #         if resp.status != 200:
-        #             body = await resp.text()
-        #             raise RuntimeError(
-        #                 f"Keycloak token request failed: {resp.status} {body}"
-        #             )
-        #         payload = await resp.json()
+        if not self._settings.keycloak_client_id or not self._settings.keycloak_client_secret:
+            raise RuntimeError(
+                "KEYCLOAK_CLIENT_ID and KEYCLOAK_CLIENT_SECRET must be configured "
+                "when KEYCLOAK_TOKEN_URL is set."
+            )
 
-        # access_token = payload["access_token"]
-        # expires_in = payload.get("expires_in", 60)
-        # self._token = access_token
-        # self._expires_at = time.time() + int(expires_in)
-        # logging.info(
-        #     "Obtained Keycloak token (expires in %ss)", int(expires_in)
-        # )
+        data = {
+            "client_id": self._settings.keycloak_client_id,
+            "client_secret": self._settings.keycloak_client_secret,
+            "grant_type": "client_credentials",
+        }
+        logging.info("Requesting Keycloak token for %s", self._settings.client_id)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self._settings.keycloak_token_url, data=data) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(
+                        f"Keycloak token request failed: {resp.status} {body}"
+                    )
+                payload = await resp.json()
+
+        access_token = payload["access_token"]
+        expires_in = payload.get("expires_in", 60)
+        self._token = access_token
+        self._expires_at = time.time() + int(expires_in)
+        logging.info("Obtained Keycloak token (expires in %ss)", int(expires_in))

@@ -5,6 +5,7 @@ type ClientInfo = {
   clientId: string;
   status: "idle" | "busy";
   connectedAt: number;
+  cameras?: string[];
 };
 
 type AppConfig = {
@@ -16,6 +17,8 @@ type AppConfig = {
   skipKeycloak: boolean;
   iceServers: RTCIceServer[];
 };
+
+const MAX_VIDEO_TILES = 4;
 
 const defaultIceServers: RTCIceServer[] = [
   { urls: ["stun:stun.l.google.com:19302"] },
@@ -96,7 +99,7 @@ if (!app) {
 app.innerHTML = `
   <div class="card">
     <h1>Remote Car Viewer</h1>
-    <p class="status" id="authStatus">Authenticating…</p>
+    <p class="status" id="authStatus">Authenticating...</p>
     <div id="manualToken" style="display: none;">
       <p>Keycloak skipped. Paste a token (or enter <code>demo</code> when insecure mode is enabled on the server).</p>
       <textarea id="tokenInput" class="token-input"></textarea>
@@ -111,9 +114,7 @@ app.innerHTML = `
       <button id="releaseBtn" class="secondary" disabled>Release</button>
       <span id="sessionStatus">Idle</span>
     </div>
-    <div class="row" style="margin-top: 1rem;">
-      <video id="remoteVideo" autoplay playsinline></video>
-    </div>
+    <div class="video-grid" id="videoGrid"></div>
     <div class="log" id="log"></div>
   </div>
 `;
@@ -129,7 +130,29 @@ const manualTokenContainer = document.getElementById(
 ) as HTMLDivElement;
 const tokenInput = document.getElementById("tokenInput") as HTMLTextAreaElement;
 const useTokenBtn = document.getElementById("useTokenBtn") as HTMLButtonElement;
-const videoElement = document.getElementById("remoteVideo") as HTMLVideoElement;
+const videoGrid = document.getElementById("videoGrid") as HTMLDivElement;
+
+const videoTiles: { wrapper: HTMLDivElement; title: HTMLSpanElement; video: HTMLVideoElement }[] = [];
+for (let i = 0; i < MAX_VIDEO_TILES; i += 1) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "video-tile";
+
+  const header = document.createElement("div");
+  header.className = "video-tile-header";
+  const title = document.createElement("span");
+  title.textContent = `Camera ${i + 1}`;
+  header.appendChild(title);
+
+  const video = document.createElement("video");
+  video.autoplay = true;
+  video.playsInline = true;
+  video.muted = true;
+
+  wrapper.appendChild(header);
+  wrapper.appendChild(video);
+  videoGrid.appendChild(wrapper);
+  videoTiles.push({ wrapper, title, video });
+}
 
 let keycloak: Keycloak | null = null;
 let token: string | null = null;
@@ -137,12 +160,15 @@ let ws: WebSocket | null = null;
 let pc: RTCPeerConnection | null = null;
 let currentClientId: string | null = null;
 let refreshInterval: number | undefined;
+let knownCars: ClientInfo[] = [];
+let expectedCameraIds: string[] = [];
+let assignedTrackCount = 0;
 
 const log = (line: string) => {
   const time = new Date().toLocaleTimeString();
   logBox.textContent = `[${time}] ${line}\n${logBox.textContent ?? ""}`.slice(
     0,
-    2000
+    2500
   );
 };
 
@@ -150,21 +176,41 @@ const setSessionState = (state: string) => {
   statusLabel.textContent = state;
 };
 
+const clearVideoTiles = () => {
+  assignedTrackCount = 0;
+  videoTiles.forEach((tile, index) => {
+    tile.video.srcObject = null;
+    const name = expectedCameraIds[index];
+    tile.title.textContent = name ? `${name} (no signal)` : `Camera ${index + 1} (no signal)`;
+  });
+};
+
+const updateExpectedCamerasForSelectedCar = () => {
+  const selectedId = carSelect.value;
+  const selectedCar = knownCars.find((car) => car.clientId === selectedId);
+  expectedCameraIds = (selectedCar?.cameras || []).slice(0, MAX_VIDEO_TILES);
+  clearVideoTiles();
+};
+
 const populateCars = (cars: ClientInfo[]) => {
+  knownCars = cars;
   const selected = carSelect.value;
   carSelect.innerHTML = "";
   const placeholder = document.createElement("option");
   placeholder.value = "";
   placeholder.textContent = cars.length ? "Select a car" : "No cars online";
   carSelect.appendChild(placeholder);
+
   cars.forEach((car) => {
     const option = document.createElement("option");
     option.value = car.clientId;
     const state = car.status === "busy" ? "busy" : "idle";
-    option.textContent = `${car.clientId} (${state})`;
+    const cameraCount = car.cameras?.length || 0;
+    option.textContent = `${car.clientId} (${state}, cams: ${cameraCount})`;
     option.disabled = car.status === "busy";
     carSelect.appendChild(option);
   });
+
   if (
     selected &&
     Array.from(carSelect.options).some((opt) => opt.value === selected)
@@ -172,24 +218,42 @@ const populateCars = (cars: ClientInfo[]) => {
     carSelect.value = selected;
   }
   connectBtn.disabled = !carSelect.value;
+  updateExpectedCamerasForSelectedCar();
 };
 
 carSelect.addEventListener("change", () => {
   connectBtn.disabled = !carSelect.value;
+  updateExpectedCamerasForSelectedCar();
 });
 
-const buildPeerConnection = () => {
+const assignTrackToTile = (track: MediaStreamTrack) => {
+  const slot = assignedTrackCount < MAX_VIDEO_TILES ? assignedTrackCount : MAX_VIDEO_TILES - 1;
+  assignedTrackCount += 1;
+  const tile = videoTiles[slot];
+  tile.video.srcObject = new MediaStream([track]);
+  const cameraName = expectedCameraIds[slot] || `Camera ${slot + 1}`;
+  tile.title.textContent = cameraName;
+  log(`Track attached to tile ${slot + 1} (${cameraName})`);
+};
+
+const buildPeerConnection = (expectedTracks: number) => {
   if (pc) {
     pc.close();
   }
+
   pc = new RTCPeerConnection({
     iceServers: config.iceServers.length ? config.iceServers : defaultIceServers,
   });
-  pc.addTransceiver("video", { direction: "recvonly" }); // ensure offer includes a video m-line
+
+  const recvTracks = Math.max(1, Math.min(MAX_VIDEO_TILES, expectedTracks || MAX_VIDEO_TILES));
+  for (let i = 0; i < recvTracks; i += 1) {
+    pc.addTransceiver("video", { direction: "recvonly" });
+  }
+
   pc.ontrack = (event) => {
-    const [stream] = event.streams;
-    videoElement.srcObject = stream;
+    assignTrackToTile(event.track);
   };
+
   pc.onicecandidate = (event) => {
     if (event.candidate && ws && currentClientId) {
       ws.send(
@@ -201,12 +265,14 @@ const buildPeerConnection = () => {
       );
     }
   };
+
   pc.onconnectionstatechange = () => {
     log(`Peer connection state: ${pc?.connectionState}`);
     if (pc?.connectionState === "disconnected") {
       releaseSession();
     }
   };
+
   return pc;
 };
 
@@ -222,7 +288,7 @@ const releaseSession = () => {
   releaseBtn.disabled = true;
   connectBtn.disabled = !carSelect.value;
   setSessionState("Idle");
-  videoElement.srcObject = null;
+  clearVideoTiles();
 };
 
 releaseBtn.addEventListener("click", () => {
@@ -239,7 +305,7 @@ connectBtn.addEventListener("click", () => {
     return;
   }
   ws.send(JSON.stringify({ type: "watch", clientId: target }));
-  setSessionState("Requesting session…");
+  setSessionState("Requesting session...");
 });
 
 const handleWatchAccepted = async (message: any) => {
@@ -247,10 +313,15 @@ const handleWatchAccepted = async (message: any) => {
     return;
   }
   currentClientId = message.clientId;
+  expectedCameraIds = Array.isArray(message.cameras)
+    ? message.cameras.slice(0, MAX_VIDEO_TILES)
+    : expectedCameraIds;
+  clearVideoTiles();
   releaseBtn.disabled = false;
   connectBtn.disabled = true;
   setSessionState(`Connecting to ${currentClientId}`);
-  const peer = buildPeerConnection();
+
+  const peer = buildPeerConnection(expectedCameraIds.length || MAX_VIDEO_TILES);
   const offer = await peer.createOffer();
   await peer.setLocalDescription(offer);
   ws.send(
@@ -281,6 +352,7 @@ const ensureSocket = () => {
       })
     );
   };
+
   ws.onmessage = async (event) => {
     const message = JSON.parse(event.data);
     switch (message.type) {
@@ -324,6 +396,7 @@ const ensureSocket = () => {
         break;
     }
   };
+
   ws.onclose = () => {
     log("Signaling socket closed");
     releaseSession();
@@ -365,7 +438,7 @@ const startWithKeycloak = async () => {
   if (keycloakInitialized) return;
   keycloakInitialized = true;
   logOauthDebugInfo();
-  authStatus.textContent = "Redirecting to Keycloak…";
+  authStatus.textContent = "Redirecting to Keycloak...";
   keycloak = new Keycloak({
     url: config.keycloakUrl,
     realm: config.keycloakRealm,
@@ -385,7 +458,7 @@ const startWithKeycloak = async () => {
     silentCheckSsoFallback: false,
     redirectUri,
     enableLogging: true,
-    useNonce: false, // Keycloak server does not echo nonce back for this client, so disable verification to avoid spurious loops
+    useNonce: false,
   };
   if (!hasOauthParams) {
     initOptions.onLoad = "login-required";
@@ -419,7 +492,7 @@ const startWithKeycloak = async () => {
 
 const startWithManualToken = () => {
   manualTokenContainer.style.display = "block";
-  authStatus.textContent = "Waiting for manual token…";
+  authStatus.textContent = "Waiting for manual token...";
   useTokenBtn.addEventListener("click", () => {
     token = tokenInput.value.trim();
     if (!token) {

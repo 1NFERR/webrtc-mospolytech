@@ -11,26 +11,25 @@ from aiortc import (
     RTCSessionDescription,
     VideoStreamTrack,
 )
-from aiortc.sdp import candidate_from_sdp
 from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
+from aiortc.sdp import candidate_from_sdp
 
-from config import Settings, load_settings
 from auth import KeycloakTokenProvider
+from config import Settings, load_settings
+from media_manager import MediaManager
 from signaling import SignalingClient
-from cams_video_track import CamsVideoStreamTrack
-from video_track import StaticImageStreamTrack
-from webcam_track import WebcamStreamTrack
 
 
 class CarWebRTCSession:
-    """Handles one WebRTC session at a time."""
+    """Handles one operator session and streams all configured cameras."""
 
     def __init__(self, settings: Settings, signaling: SignalingClient):
         self._settings = settings
         self._signaling = signaling
         self._pc: Optional[RTCPeerConnection] = None
         self._rtc_configuration: RTCConfiguration = self._build_rtc_configuration()
-        self._video_track: Optional[VideoStreamTrack] = None
+        self._video_tracks: list[VideoStreamTrack] = []
+        self._media_manager = MediaManager(settings)
 
     def _build_rtc_configuration(self) -> RTCConfiguration:
         ice_servers = []
@@ -51,8 +50,8 @@ class CarWebRTCSession:
 
     async def handle_offer(self, payload: dict) -> None:
         logging.info("Received offer from operator")
-        logging.info("Preparing peer connection for new session")
         await self._cleanup()
+        self._media_manager.refresh_all_sources()
 
         self._pc = RTCPeerConnection(configuration=self._rtc_configuration)
         logging.debug(
@@ -78,25 +77,20 @@ class CarWebRTCSession:
             )
 
         desc = RTCSessionDescription(sdp=payload["sdp"], type=payload["sdpType"])
-        logging.debug("Applying remote description type=%s", desc.type)
         await self._pc.setRemoteDescription(desc)
-        logging.debug("Remote description applied")
 
-        logging.info(
-            "Creating video track from source '%s'", self._settings.video_source
-        )
-        self._video_track = self._create_video_track()
-        self._pc.addTrack(self._video_track)
-        logging.debug("Video track added")
+        camera_ids = self._media_manager.available_camera_ids()
+        logging.info("Adding %d camera tracks: %s", len(camera_ids), camera_ids)
+
+        for camera_id in camera_ids:
+            track = self._media_manager.get_track(camera_id)
+            self._video_tracks.append(track)
+            self._pc.addTrack(track)
 
         for transceiver in self._pc.getTransceivers():
             if getattr(transceiver, "_offerDirection", None) is None:
-                logging.debug(
-                    "Defaulting missing offer direction to sendrecv for %s", transceiver.kind
-                )
                 transceiver._offerDirection = "sendrecv"
 
-        logging.debug("Creating SDP answer")
         answer = await self._pc.createAnswer()
         await self._pc.setLocalDescription(answer)
         await self._signaling.send(
@@ -105,9 +99,10 @@ class CarWebRTCSession:
                 "clientId": self._settings.client_id,
                 "sdp": self._pc.localDescription.sdp,
                 "sdpType": self._pc.localDescription.type,
+                "cameras": camera_ids,
             }
         )
-        logging.info("Sent answer to operator")
+        logging.info("Sent answer with %d camera tracks", len(camera_ids))
 
     async def handle_remote_candidate(self, payload: dict) -> None:
         if not self._pc:
@@ -124,9 +119,7 @@ class CarWebRTCSession:
         try:
             rtc_candidate = candidate_from_sdp(sdp)
         except Exception:
-            logging.exception(
-                "Failed to parse remote candidate: %s", candidate_payload
-            )
+            logging.exception("Failed to parse remote candidate: %s", candidate_payload)
             return
         rtc_candidate.sdpMid = candidate_payload.get("sdpMid")
         rtc_candidate.sdpMLineIndex = candidate_payload.get("sdpMLineIndex")
@@ -138,6 +131,7 @@ class CarWebRTCSession:
 
     async def stop(self) -> None:
         await self._cleanup()
+        await self._media_manager.shutdown()
 
     async def _cleanup(self) -> None:
         if self._pc:
@@ -145,32 +139,10 @@ class CarWebRTCSession:
             await self._pc.close()
             self._pc = None
             await self._signaling.send({"type": "release"})
-        if self._video_track:
-            await self._video_track.stop()
-            self._video_track = None
 
-    def _create_video_track(self) -> VideoStreamTrack:
-        source = self._settings.video_source.lower()
-        if source == "webcam":
-            return WebcamStreamTrack(
-                camera_index=0,
-                fps=30,
-                width=1280,
-                height=720,
-            )
-        if source == "cams_video":
-            return CamsVideoStreamTrack(
-                folder=self._settings.cams_video_folder,
-                filename=self._settings.cams_video_filename,
-            )
-        if source == "static_image":
-            return StaticImageStreamTrack(self._settings.image_path)
-
-        logging.warning(
-            "Unknown video_source '%s', falling back to static image",
-            self._settings.video_source,
-        )
-        return StaticImageStreamTrack(self._settings.image_path)
+        for track in self._video_tracks:
+            track.stop()
+        self._video_tracks.clear()
 
 
 async def main() -> None:

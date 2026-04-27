@@ -1,17 +1,6 @@
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
-export const createTokenVerifier = ({ jwksUrl, issuer, allowInsecure }) => {
-  if (allowInsecure) {
-    console.warn("[token] ALLOW_INSECURE_TOKENS is enabled - DO NOT USE IN PROD");
-    return async () => ({
-      sub: "demo-user",
-      preferred_username: "demo",
-      client_id: "demo-client",
-      realm_access: { roles: ["operator"] },
-      resource_access: {},
-    });
-  }
-
+export const createTokenVerifier = ({ jwksUrl, issuer }) => {
   if (!jwksUrl || !issuer) {
     throw new Error("KEYCLOAK_JWKS_URL and KEYCLOAK_ISSUER must be provided");
   }
