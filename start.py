@@ -152,11 +152,14 @@ def main() -> int:
     signaling_env["PORT"] = str(signaling_port)
 
     frontend_env = os.environ.copy()
-    frontend_env["VITE_SIGNALING_WS_URL"] = f"ws://127.0.0.1:{signaling_port}/ws"
-    frontend_env["VITE_SIGNALING_HTTP_URL"] = f"http://127.0.0.1:{signaling_port}"
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("1.1.1.1", 80))
+        local_ip = s.getsockname()[0]
+    frontend_env["VITE_SIGNALING_WS_URL"] = f"ws://{local_ip}:{signaling_port}/ws"
+    frontend_env["VITE_SIGNALING_HTTP_URL"] = f"http://{local_ip}:{signaling_port}"
 
     car_env = os.environ.copy()
-    car_env["SIGNALING_WS_URL"] = f"ws://127.0.0.1:{signaling_port}/ws"
+    car_env["SIGNALING_WS_URL"] = f"ws://{local_ip}:{signaling_port}/ws"
 
     processes: list[subprocess.Popen] = []
 
