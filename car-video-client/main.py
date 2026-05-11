@@ -14,6 +14,9 @@ from aiortc import (
 from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
 
+import av
+av.logging.set_level(av.logging.ERROR)
+
 from auth import KeycloakTokenProvider
 from config import Settings, load_settings
 from media_manager import MediaManager
