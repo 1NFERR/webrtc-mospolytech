@@ -1,6 +1,15 @@
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
-export const createTokenVerifier = ({ jwksUrl, issuer }) => {
+export const createTokenVerifier = ({ jwksUrl, issuer, allowInsecure }) => {
+  if (allowInsecure) {
+    // В insecure режиме всё скипаем
+    return async (token) => ({
+      sub: token,
+      client_id: token,
+      preffered_username: token,
+    });
+  }
+  
   if (!jwksUrl || !issuer) {
     throw new Error("KEYCLOAK_JWKS_URL and KEYCLOAK_ISSUER must be provided");
   }
